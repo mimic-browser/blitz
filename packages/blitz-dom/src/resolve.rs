@@ -3,6 +3,48 @@
 use blitz_traits::node_id::NodeId;
 use std::cell::RefCell;
 
+// Profile-only exclusive top-level wall envelopes. No clocks/allocations when
+// disabled; these phases nest inside the Go nativeResolve envelope.
+struct MimicResolveProfile {
+    last: std::time::Instant,
+    phases: Vec<(&'static str, f64)>,
+}
+impl MimicResolveProfile {
+    fn enabled() -> Option<Self> {
+        if std::env::var_os("MIMIC_PROFILE_BLITZ").is_some_and(|v| v == "1") {
+            Some(Self {
+                last: std::time::Instant::now(),
+                phases: Vec::with_capacity(12),
+            })
+        } else {
+            None
+        }
+    }
+    fn mark(profile: &mut Option<Self>, name: &'static str) {
+        if let Some(profile) = profile {
+            let now = std::time::Instant::now();
+            profile.phases.push((
+                name,
+                now.duration_since(profile.last).as_secs_f64() * 1000.0,
+            ));
+            profile.last = now;
+        }
+    }
+    fn emit(profile: Option<Self>, document: impl std::fmt::Debug) {
+        if let Some(profile) = profile {
+            let fields: Vec<String> = profile
+                .phases
+                .iter()
+                .map(|(name, ms)| format!("\"{name}\":{ms:.6}"))
+                .collect();
+            eprintln!(
+                "BLITZ native-phases {{\"document\":\"{document:?}\",\"phasesWallMS\":{{{}}}}}",
+                fields.join(",")
+            );
+        }
+    }
+}
+
 use debug_timer::debug_timer;
 use kurbo::{Affine, Rect};
 use parley::LayoutContext;
@@ -37,6 +79,7 @@ use crate::{
 impl BaseDocument {
     /// Restyle the tree and then relayout it
     pub fn resolve(&mut self, current_time_for_animations: f64) {
+        let mut mimic_profile = MimicResolveProfile::enabled();
         if TDocument::as_node(&self.root_node())
             .first_element_child()
             .is_none()
@@ -79,9 +122,12 @@ impl BaseDocument {
         // accumulated since the last resolve as a single device rebuild.
         self.flush_pending_device_changes();
 
+        MimicResolveProfile::mark(&mut mimic_profile, "preludeDevice");
+
         // we need to resolve stylist first since it will need to drive our layout bits
         self.resolve_stylist(current_time_for_animations);
         timer.record_time("style");
+        MimicResolveProfile::mark(&mut mimic_profile, "style");
 
         // Propagate damage flags (from mutation and restyles) up and down the tree
         if self.incremental_layout {
@@ -90,8 +136,10 @@ impl BaseDocument {
         }
 
         // Fix up tree for layout (insert anonymous blocks as necessary, etc)
+        MimicResolveProfile::mark(&mut mimic_profile, "damage");
         self.resolve_layout_children();
         timer.record_time("construct");
+        MimicResolveProfile::mark(&mut mimic_profile, "construct");
 
         self.resolve_deferred_tasks();
         // Flush background/mask images from style to dedicated storage on the
@@ -99,18 +147,22 @@ impl BaseDocument {
         // pseudo-element box construction), fetching any not-yet-loaded images.
         self.flush_pending_style_images();
         timer.record_time("pconstruct");
+        MimicResolveProfile::mark(&mut mimic_profile, "deferredShapingAndImages");
 
         // Merge stylo into taffy
         self.flush_styles_to_layout(root_node_id);
         timer.record_time("flush");
+        MimicResolveProfile::mark(&mut mimic_profile, "flush");
 
         // Next we resolve layout with the data resolved by stlist
         self.resolve_layout();
         timer.record_time("layout");
+        MimicResolveProfile::mark(&mut mimic_profile, "layout");
 
         // Resolve transforms
         self.resolve_transforms(root_node_id);
         timer.record_time("transform");
+        MimicResolveProfile::mark(&mut mimic_profile, "transforms");
 
         // Clear all damage and dirty flags, walking only subtrees which are
         // marked as (potentially) containing damage.
@@ -128,6 +180,7 @@ impl BaseDocument {
         // restyle is picked up on the next resolve pass; a redraw is requested
         // if the hovered node actually changes.
         self.refresh_hover();
+        MimicResolveProfile::mark(&mut mimic_profile, "cleanupHover");
 
         let mut subdoc_is_animating = false;
         for &node_id in &self.sub_document_nodes {
@@ -155,6 +208,8 @@ impl BaseDocument {
         }
         self.subdoc_is_animating = subdoc_is_animating;
         timer.record_time("subdocs");
+        MimicResolveProfile::mark(&mut mimic_profile, "subdocuments");
+        MimicResolveProfile::emit(mimic_profile, self.id());
 
         timer.print_times(&format!("Resolve({}): ", self.id()));
     }

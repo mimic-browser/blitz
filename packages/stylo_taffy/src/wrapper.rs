@@ -117,12 +117,22 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
         convert::inset_rect(&self.style)
     }
 
-    /// Every box acts as the containing block for its own out-of-flow children, so
-    /// absolutely positioned boxes are laid out relative to their parent rather than
-    /// being hoisted to their CSS containing block.
+    /// Claims mirror CSS containing-block establishment. Unclaimed candidates
+    /// bubble to their ancestor through Taffy's existing OOF pipeline.
     #[inline]
     fn is_containing_block(&self) -> taffy::ContainingBlockClaims {
-        taffy::ContainingBlockClaims::ALL
+        use style::values::specified::box_::{Contain, WillChangeBits};
+        let box_style = self.style.get_box();
+        let fixed = !self.style.clone_transform().0.is_empty()
+            || !matches!(self.style.clone_translate(), style::values::computed::transform::Translate::None)
+            || !matches!(self.style.clone_rotate(), style::values::computed::transform::Rotate::None)
+            || !matches!(self.style.clone_scale(), style::values::computed::transform::Scale::None)
+            || !matches!(self.style.clone_perspective(), style::values::computed::box_::Perspective::None)
+            || box_style.contain.intersects(Contain::LAYOUT | Contain::PAINT)
+            || self.style.clone_will_change().bits.intersects(
+                WillChangeBits::TRANSFORM | WillChangeBits::PERSPECTIVE | WillChangeBits::FIXPOS_CB_NON_SVG)
+            || !self.style.clone_filter().0.is_empty();
+        taffy::ContainingBlockClaims { absolute: fixed || self.position().is_positioned(), fixed }
     }
 
     #[inline]

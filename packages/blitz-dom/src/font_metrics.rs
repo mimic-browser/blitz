@@ -45,6 +45,16 @@ pub(crate) fn normal_line_height(
     font_size: f32,
     scale: f32,
 ) -> Option<f32> {
+    let (ascent, descent, leading) = font_line_metrics(font_ctx, font_styles, font_size, scale)?;
+    Some(ascent + descent + leading)
+}
+
+pub(crate) fn font_line_metrics(
+    font_ctx: &mut FontContext,
+    font_styles: &FontStyles,
+    font_size: f32,
+    scale: f32,
+) -> Option<(f32, f32, f32)> {
     use parley::fontique::{QueryFont, QueryStatus};
     use skrifa::instance::{LocationRef, Size};
     use skrifa::metrics::Metrics;
@@ -82,8 +92,45 @@ pub(crate) fn normal_line_height(
         Size::new(font_size * scale),
         LocationRef::from(&location),
     );
-    let line_height = metrics.ascent.round() + (-metrics.descent).round() + metrics.leading.round();
-    Some(line_height / scale)
+    Some((metrics.ascent.round() / scale, (-metrics.descent).round() / scale, metrics.leading.round() / scale))
+}
+
+/// Windows Chrome text controls use the primary font's average and maximum
+/// character widths, not a fixed number of pixels per character. DirectWrite's
+/// Skia metrics do not supply an average: Blink uses the advance of `x`.
+/// The maximum is the primary font's global glyph bounding-box width.
+pub(crate) fn control_character_widths(
+    font_ctx: &mut FontContext,
+    font_styles: &FontStyles,
+    font_size: f32,
+) -> Option<(f32, f32)> {
+    use parley::fontique::{QueryFont, QueryStatus};
+    use skrifa::instance::{LocationRef, Size};
+    use skrifa::metrics::GlyphMetrics;
+    use skrifa::raw::TableProvider;
+
+    let mut query = query_for_font_styles(font_ctx, font_styles);
+    let mut selected: Option<QueryFont> = None;
+    query.matches_with(|font| {
+        selected = Some(font.clone());
+        QueryStatus::Stop
+    });
+    let font = selected?;
+    let face = skrifa::FontRef::from_index(font.blob.as_ref(), font.index).ok()?;
+    let variations = stylo_to_parley::font_variations(&font_styles.font_variation_settings);
+    let location = face.axes().location(
+        variations
+            .iter()
+            .map(|v| (skrifa::Tag::from_be_bytes(v.tag.to_bytes()), v.value)),
+    );
+    let glyphs = GlyphMetrics::new(&face, Size::new(font_size), LocationRef::from(&location));
+    let advance = glyphs.advance_width(face.charmap().map('x')?)?;
+    let average = advance.max(advance.round());
+    let head = face.head().ok()?;
+    let maximum = ((f32::from(head.x_max()) - f32::from(head.x_min())) * font_size
+        / f32::from(head.units_per_em()))
+    .round();
+    Some((average, maximum))
 }
 
 #[derive(Clone)]

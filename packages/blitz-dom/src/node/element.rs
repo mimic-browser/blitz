@@ -129,6 +129,17 @@ pub struct LayoutData {
     pub final_layout: Layout,
     pub scroll_offset: crate::Point<f64>,
     pub scrollable_overflow: KurboRect,
+    /// OOF positioning ownership is distinct from canonical and layout ancestry.
+    pub geometry_parent: Option<NodeId>,
+    /// The producer claimed this box against the initial viewport, not its owner's box.
+    pub viewport_positioned: bool,
+    pub hoisted_children: Vec<NodeId>,
+    /// Anonymous closed-details content is laid out for CSSOM readback but
+    /// contributes zero block extent to its parent's normal flow.
+    pub skipped_details_content: bool,
+    /// Definite content width only while this node's producer call is active.
+    /// Restored on return; never an independently validated geometry result.
+    pub active_layout_width: Option<f32>,
 }
 
 impl LayoutData {
@@ -139,6 +150,11 @@ impl LayoutData {
             final_layout: Layout::new(),
             scroll_offset: crate::Point::ZERO,
             scrollable_overflow: KurboRect::ZERO,
+            geometry_parent: None,
+            viewport_positioned: false,
+            hoisted_children: Vec::new(),
+            skipped_details_content: false,
+            active_layout_width: None,
         }
     }
 }
@@ -839,6 +855,8 @@ impl RasterImageData {
 
 #[derive(Debug, Clone)]
 pub enum ImageData {
+    /// Canonical resource metadata for non-rendering embedders. No pixel buffer.
+    Intrinsic { width: u32, height: u32, complete: bool },
     Raster(RasterImageData),
     #[cfg(feature = "svg")]
     Svg(SvgImageData),
@@ -885,6 +903,7 @@ impl std::fmt::Debug for SpecialElementData {
             SpecialElementData::CustomWidget(_) => f.write_str("NodeSpecificData::CustomWidget"),
             SpecialElementData::Stylesheet(_) => f.write_str("NodeSpecificData::Stylesheet"),
             SpecialElementData::Image(data) => match **data {
+                ImageData::Intrinsic { .. } => f.write_str("NodeSpecificData::Image(Intrinsic)"),
                 ImageData::Raster(_) => f.write_str("NodeSpecificData::Image(Raster)"),
                 #[cfg(feature = "svg")]
                 ImageData::Svg(_) => f.write_str("NodeSpecificData::Image(Svg)"),

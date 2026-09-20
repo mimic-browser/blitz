@@ -154,3 +154,9 @@ pub fn build_single_font_ctx(font_data: &[u8]) -> FontContext {
     }
     ctx
 }
+mod fonts;
+mod intrinsic_images;
+mod table_geometry;
+mod skipped_content;
+mod live_controls;
+pub use fonts::CanonicalFont;

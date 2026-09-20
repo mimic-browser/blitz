@@ -49,6 +49,21 @@ input[type=tel]:dir(ltr) {
     direction: ltr;
 }
 
+/* Windows Chrome 152 form control defaults. These remain UA declarations,
+ * so author styles override them through the normal cascade. */
+input,
+button,
+select,
+textarea {
+    box-sizing: border-box;
+    font: 400 13.333333333333333px Arial;
+    letter-spacing: normal;
+    word-spacing: normal;
+    text-transform: none;
+    text-indent: 0;
+    text-shadow: none;
+}
+
 input {
     display: inline-block;
 }
@@ -58,25 +73,50 @@ input[type="hidden" i] {
     display: none !important;
 }
 
-input[type="checkbox"] {
-    width: 14px;
-    height: 14px;
+input[type="checkbox" i] {
+    width: 13px;
+    height: 13px;
+    padding: 0;
+    border: 0;
     margin: 3px 3px 3px 4px;
 }
 
-input[type="radio"] {
-    width: 14px;
-    height: 14px;
-    border-radius: 14px;
-    border: none;
-    margin: 3px 3px 3px 4px;
+input[type="radio" i] {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    padding: 0;
+    border: 0;
+    margin: 3px 3px 0 5px;
 }
 
-input,
+input {
+    border: 2px inset;
+    padding: 1px 2px;
+    background-color: white;
+}
+
 textarea {
-    border: 1px solid #999;
+    font-family: monospace;
+    border: 1px solid;
     padding: 2px;
     background-color: white;
+    overflow: auto;
+}
+
+select {
+    display: inline-block;
+    appearance: auto;
+    border: 1px solid;
+    padding: 0;
+}
+
+progress {
+    display: inline-block;
+    width: 10em;
+    height: 1em;
+    vertical-align: -0.2em;
+    box-sizing: border-box;
 }
 
 input:focus,
@@ -85,10 +125,10 @@ textarea:focus {
 }
 
 button,
-input[type="submit"],
-input[type="reset"],
-input[type="button"] {
-    border: 1px solid #999;
+input[type="submit" i],
+input[type="reset" i],
+input[type="button" i] {
+    border: 2px outset;
     border-radius: 1px;
     padding: 1px 6px;
     color: black;
@@ -880,11 +920,8 @@ details[open]>summary:first-of-type {
     list-style-type: disclosure-open;
 }
 
-/* When a <details> is closed, only its first <summary> is shown. Everything
- * else (including any additional summaries) is hidden. */
-details:not([open])>:not(summary:first-of-type) {
-    display: none !important;
-}
+/* Closed details content is a skipped anonymous layout subtree. Do not apply
+ * display:none to canonical descendants: Chrome retains their CSSOM boxes. */
 
 /* media elements */
 video {
@@ -1072,11 +1109,12 @@ slot {
     }
 }
 
-/* Hide noscript elements if scripting is enabled */
-@media (scripting) {
-    noscript {
-        display: none !important;
-    }
+/* Mimic's document runtime has scripting enabled. Stylo's Servo media-feature
+ * table does not implement `scripting`, so the upstream conditional UA rule
+ * cannot express this runtime input. A scripting-disabled document mode must
+ * select a corresponding UA sheet if such a mode is introduced. */
+noscript {
+    display: none !important;
 }
 
 @media print {

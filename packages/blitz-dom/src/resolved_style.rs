@@ -38,6 +38,28 @@ fn format_px(px: f32) -> String {
     CSSPixelLength::new(px).to_css_string()
 }
 
+fn has_top_level_comma(value: &str) -> bool {
+    let mut depth = 0u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped { escaped = false; continue; }
+        if ch == '\\' { escaped = true; continue; }
+        if let Some(active) = quote {
+            if ch == active { quote = None; }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Resolve a computed inset value to CSS pixels against the given percentage
 /// basis. Returns `None` for `auto` (and unsupported anchor functions).
 fn resolve_inset<P>(val: &GenericInset<P, LengthPercentage>, basis: f32) -> Option<f32> {
@@ -47,13 +69,18 @@ fn resolve_inset<P>(val: &GenericInset<P, LengthPercentage>, basis: f32) -> Opti
     }
 }
 
-/// Serialize a transform matrix component rounded to 6 decimal places (as
-/// browsers do when serializing resolved transform matrices)
+/// Chrome CSSOM numbers use six significant digits, not six decimal places.
 fn format_matrix_component(v: f64) -> String {
-    let rounded = (v * 1e6).round() / 1e6;
-    // Avoid "-0"
-    let rounded = if rounded == 0.0 { 0.0 } else { rounded };
-    format!("{rounded}")
+    let v = v.clamp(-(f32::MAX as f64), f32::MAX as f64);
+    let rounded: f64 = format!("{v:.5e}").parse().unwrap_or(v);
+    if rounded == 0.0 { return "0".into(); }
+    if rounded.abs() < 0.0001 || rounded.abs() >= 1_000_000.0 {
+        let scientific = format!("{rounded:e}");
+        let (mantissa, exponent) = scientific.split_once('e').unwrap();
+        let exponent: i32 = exponent.parse().unwrap();
+        return format!("{mantissa}e{}{exponent:02}", if exponent < 0 { "-" } else { "+" }, exponent = exponent.abs());
+    }
+    rounded.to_string()
 }
 
 /// Serialize a used transform matrix the way `getComputedStyle()` does
@@ -158,6 +185,51 @@ pub fn resolved_style_property_names() -> &'static [&'static str] {
 }
 
 impl BaseDocument {
+    /// The canonical CSSOM owns parsed precision separately from cssText.
+    /// Replace only its declaration block: attribute selectors keep cssText.
+    pub fn set_canonical_inline_declarations(&mut self, node_id: NodeId, css: &str) {
+        let block = parse_style_attribute(css, &self.url.url_extra_data(), None,
+            QuirksMode::NoQuirks, CssRuleType::Style);
+        let node = &mut self.nodes[node_id];
+        node.element_data_mut().unwrap().style_attribute =
+            Some(ServoArc::new(self.guard.wrap(block)));
+        node.set_restyle_hint(style::invalidation::element::restyle_hints::RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
+    }
+    /// Geometry consumes the unrounded transform product, never the CSSOM
+    /// six-significant-digit string. The trailing values are local origins.
+    pub fn geometry_transform(&self, node_id: NodeId) -> Option<[f64; 19]> {
+        self.with_resolved_styles(node_id, |node, styles, _| {
+            let transform = &styles.get_box().transform;
+            if transform.0.is_empty() { return None; }
+            let layout = node.unrounded_layout();
+            let reference = euclid::Rect::new(
+                euclid::Point2D::new(CSSPixelLength::new(0.0), CSSPixelLength::new(0.0)),
+                euclid::Size2D::new(CSSPixelLength::new(layout.size.width), CSSPixelLength::new(layout.size.height)),
+            );
+            // Length-valued geometry inputs pass through Chrome's signed
+            // 26.6 LayoutUnit range before matrix composition. Numeric matrix
+            // components and scale factors must not receive this clamp.
+            use style::values::computed::transform::TransformOperation as Op;
+            let length = |v: CSSPixelLength| CSSPixelLength::new(v.px().clamp(-33554430.0, 33554429.0));
+            let lp = |v: &LengthPercentage, basis| LengthPercentage::new_length(length(v.resolve(basis)));
+            let operations: Vec<_> = transform.0.iter().map(|op| match op {
+                Op::Translate(x,y) => Op::Translate(lp(x,reference.width()),lp(y,reference.height())),
+                Op::TranslateX(x) => Op::TranslateX(lp(x,reference.width())),
+                Op::TranslateY(y) => Op::TranslateY(lp(y,reference.height())),
+                Op::TranslateZ(z) => Op::TranslateZ(length(*z)),
+                Op::Translate3D(x,y,z) => Op::Translate3D(lp(x,reference.width()),lp(y,reference.height()),length(*z)),
+                _ => op.clone(),
+            }).collect();
+            let transform = style::values::generics::transform::GenericTransform(operations.into());
+            let (m, _) = transform.to_transform_3d_matrix_f64(Some(&reference)).ok()?;
+            let origin = &styles.get_box().transform_origin;
+            Some([m.m11,m.m12,m.m13,m.m14,m.m21,m.m22,m.m23,m.m24,m.m31,m.m32,m.m33,m.m34,m.m41,m.m42,m.m43,m.m44,
+                origin.horizontal.resolve(reference.width()).px() as f64,
+                origin.vertical.resolve(reference.height()).px() as f64,
+                origin.depth.px() as f64])
+        }).flatten()
+    }
+
     /// Check whether `value` is a valid value for the CSS property `property`.
     /// Used by CSSOM APIs (`element.style.setProperty` and friends), which must
     /// ignore invalid declarations.
@@ -341,9 +413,24 @@ impl BaseDocument {
     /// resolve to *used* values, so [`resolve`](Self::resolve) should be called
     /// before this method to ensure layout is up to date.
     pub fn resolved_style_value(&self, node_id: NodeId, property_name: &str) -> String {
-        let Some(node) = self.get_node(node_id) else {
-            return String::new();
-        };
+        self.with_resolved_styles(node_id, |node, styles, has_stored_styles| {
+            self.serialize_resolved_style(node_id, node, styles, has_stored_styles, property_name)
+        }).unwrap_or_default()
+    }
+
+    /// Read a set of properties from one authoritative computed result. Hidden
+    /// descendants need on-demand style resolution, but it is performed once
+    /// for the entire batch and never installed as a fake layout primary style.
+    pub fn resolved_style_values(&self, node_id: NodeId, property_names: &[&str]) -> Vec<String> {
+        self.with_resolved_styles(node_id, |node, styles, has_stored_styles| {
+            property_names.iter().map(|name| {
+                self.serialize_resolved_style(node_id, node, styles, has_stored_styles, name)
+            }).collect()
+        }).unwrap_or_else(|| vec![String::new(); property_names.len()])
+    }
+
+    fn with_resolved_styles<R>(&self, node_id: NodeId, read: impl FnOnce(&crate::node::Node, &ComputedValues, bool) -> R) -> Option<R> {
+        let node = self.get_node(node_id)?;
         // Elements inside a `display: none` subtree are skipped by the style
         // traversal, so their style has to be computed on demand.
         let undisplayed_styles;
@@ -355,10 +442,41 @@ impl BaseDocument {
                     undisplayed_styles = styles;
                     &undisplayed_styles
                 }
-                None => return String::new(),
+                None => return None,
             },
         };
 
+        Some(read(node, styles, stored_styles.is_some()))
+    }
+
+    fn serialize_resolved_style(&self, node_id: NodeId, node: &crate::node::Node, styles: &ComputedValues, has_stored_styles: bool, property_name: &str) -> String {
+        // Normalize aliases and logical longhands before the used-value cases.
+        // ComputedValues stores physical properties; its generic string getter
+        // alone does not apply CSSOM's logical used-size/edge mapping.
+        let property_name = match property_name {
+            "-webkit-logical-width" => "inline-size",
+            "-webkit-logical-height" => "block-size",
+            "-webkit-min-logical-width" => "min-inline-size",
+            "-webkit-min-logical-height" => "min-block-size",
+            "-webkit-max-logical-width" => "max-inline-size",
+            "-webkit-max-logical-height" => "max-block-size",
+            "-webkit-border-before" => "border-block-start",
+            "-webkit-border-after" => "border-block-end",
+            "-webkit-border-start" => "border-inline-start",
+            "-webkit-border-end" => "border-inline-end",
+            _ => property_name,
+        };
+        let parsed = PropertyId::parse_enabled_for_all_content(property_name).ok();
+        let property_name = match parsed.as_ref() {
+            Some(id) => match id.longhand_id() {
+                Some(longhand) => longhand.to_physical(styles.writing_mode).name(),
+                None => match id.as_shorthand() {
+                    Ok(shorthand) => shorthand.name(),
+                    Err(_) => property_name,
+                },
+            },
+            None => property_name,
+        };
         let display = styles.clone_display();
         // Non-atomic inline elements are laid out as style spans within their
         // inline root's text layout rather than as boxes of their own, so their
@@ -374,8 +492,57 @@ impl BaseDocument {
                     || *tag == local_name!("button"))
             });
         let generates_box =
-            node.flags.is_in_document() && !display.is_none() && stored_styles.is_some();
+            node.flags.is_in_document() && !display.is_none() && has_stored_styles;
         let has_layout_box = generates_box && !is_non_atomic_inline;
+
+        // These CSSOM shorthands include their initial-valued components,
+        // unlike the declaration serializer which is allowed to omit them.
+        let read = |name: &str| self.serialize_resolved_style(node_id, node, styles, has_stored_styles, name);
+        match property_name {
+            // The embedding producer eligibility check rejects all authored
+            // declarations of this Servo-unsupported property, including inline
+            // and escaped identifiers. Only its inherited-free initial state
+            // reaches native publication; no legacy cascade is needed per read.
+            "content-visibility" => return "visible".to_string(),
+            "text-decoration" if read("text-decoration-line") == "none" => return "none".to_string(),
+            "grid" => return ["grid-template-rows", "grid-template-columns", "grid-template-areas", "grid-auto-flow", "grid-auto-rows", "grid-auto-columns"].map(read).join(" / "),
+            "background" => {
+                let images = read("background-image");
+                // Each layer has independently cascaded longhands. The common
+                // single-layer case needs full CSSOM output, including defaults;
+                // multi-layer declarations retain Stylo's serializer below.
+                if !has_top_level_comma(&images) {
+                    return format!("{} {} {} {} {} / {} {} {}", read("background-color"), images, read("background-repeat"), read("background-attachment"), read("background-position"), read("background-size"), read("background-origin"), read("background-clip"));
+                }
+            }
+            "flex-flow" => return format!("{} {}", read("flex-direction"), read("flex-wrap")),
+            "list-style" => return format!("{} {} {}", read("list-style-position"), read("list-style-image"), read("list-style-type")),
+            "outline" => return format!("{} {} {}", read("outline-color"), read("outline-style"), read("outline-width")),
+            "border-top" | "border-right" | "border-bottom" | "border-left" => return format!("{} {} {}", read(&format!("{property_name}-width")), read(&format!("{property_name}-style")), read(&format!("{property_name}-color"))),
+            "border" => {
+                let top = read("border-top");
+                return if ["border-right", "border-bottom", "border-left"].iter().all(|side| read(side) == top) { top } else { String::new() };
+            }
+            "border-block-start" | "border-block-end" | "border-inline-start" | "border-inline-end" => return format!("{} {} {}", read(&format!("{property_name}-width")), read(&format!("{property_name}-style")), read(&format!("{property_name}-color"))),
+            "border-block" | "border-inline" => {
+                let start = read(&format!("{property_name}-start"));
+                return if start == read(&format!("{property_name}-end")) { start } else { String::new() };
+            }
+            "transform-origin" => {
+                let origin = &styles.get_box().transform_origin;
+                let size = if has_layout_box { node.unrounded_layout().size } else { taffy::Size::ZERO };
+                let x = format_px(origin.horizontal.resolve(CSSPixelLength::new(size.width)).px());
+                let y = format_px(origin.vertical.resolve(CSSPixelLength::new(size.height)).px());
+                let depth = origin.depth.to_css_string();
+                return if depth == "0px" { format!("{x} {y}") } else { format!("{x} {y} {depth}") };
+            }
+            "perspective-origin" => {
+                let origin = &styles.get_box().perspective_origin;
+                let size = if has_layout_box { node.unrounded_layout().size } else { taffy::Size::ZERO };
+                return format!("{} {}", format_px(origin.horizontal.resolve(CSSPixelLength::new(size.width)).px()), format_px(origin.vertical.resolve(CSSPixelLength::new(size.height)).px()));
+            }
+            _ => {}
+        }
 
         // Layout-dependent "used value" special cases
         match property_name {
@@ -433,7 +600,10 @@ impl BaseDocument {
             "width" | "height" if has_layout_box => {
                 // Used value: the layout size interpreted according to `box-sizing`
                 // (border-box size for `border-box`, content-box size for `content-box`)
-                let layout = node.final_layout();
+                // Device-pixel rounding belongs to painting/offset metrics,
+                // not CSSOM used lengths. Preserve the producer's fractional
+                // content box rather than round-tripping through final layout.
+                let layout = node.unrounded_layout();
                 let border_box = styles.get_position().box_sizing == BoxSizing::BorderBox;
                 let size = if property_name == "width" {
                     if border_box {
@@ -459,7 +629,7 @@ impl BaseDocument {
             "margin-top" | "margin-right" | "margin-bottom" | "margin-left" if has_layout_box => {
                 // Used value: the margin resolved by layout (percentages and
                 // `auto` margins resolved to lengths)
-                let layout = node.final_layout();
+                let layout = node.unrounded_layout();
                 let margin = match property_name {
                     "margin-top" => layout.margin.top,
                     "margin-right" => layout.margin.right,
@@ -475,7 +645,7 @@ impl BaseDocument {
                     .layout_parent
                     .get()
                     .and_then(|id| self.get_node(id))
-                    .map(|parent| *parent.final_layout());
+                    .map(|parent| *parent.unrounded_layout());
 
                 match position {
                     // Used value: the relative offset. An `auto` side resolves
@@ -546,7 +716,21 @@ impl BaseDocument {
                     // used distance between the box's margin edge and the
                     // corresponding edge of the containing block's padding box.
                     Position::Absolute | Position::Fixed => {
-                        if let Some(pl) = parent_layout {
+                        // OOF layout publishes its containing-block owner; the
+                        // canonical/layout parent is not necessarily that box.
+                        let containing_layout = if node.layout_data().viewport_positioned {
+                            let viewport = self.stylist.device().au_viewport_size();
+                            Some(taffy::Layout {
+                                size: taffy::Size { width: viewport.width.to_f32_px(), height: viewport.height.to_f32_px() },
+                                ..taffy::Layout::new()
+                            })
+                        } else {
+                            node.layout_data().geometry_parent
+                                .or(node.layout_parent.get())
+                                .and_then(|id| self.get_node(id))
+                                .map(|parent| *parent.unrounded_layout())
+                        };
+                        if let Some(pl) = containing_layout {
                             let cb_width = pl.size.width - pl.border.left - pl.border.right;
                             let cb_height = pl.size.height - pl.border.top - pl.border.bottom;
 
@@ -562,7 +746,7 @@ impl BaseDocument {
                                 return format_px(value);
                             }
 
-                            let layout = node.final_layout();
+                            let layout = node.unrounded_layout();
                             let margin_box_top =
                                 layout.location.y - layout.margin.top - pl.border.top;
                             let margin_box_left =
@@ -608,7 +792,7 @@ impl BaseDocument {
                 if !transform.0.is_empty() {
                     // Used value: the transform list resolved to a matrix, with
                     // percentages resolved against the border box
-                    let layout = node.final_layout();
+                    let layout = node.unrounded_layout();
                     let reference_box = euclid::Rect::new(
                         euclid::Point2D::new(CSSPixelLength::new(0.0), CSSPixelLength::new(0.0)),
                         euclid::Size2D::new(

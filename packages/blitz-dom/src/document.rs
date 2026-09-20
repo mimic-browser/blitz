@@ -33,7 +33,7 @@ use selectors::{Element, matching::QuirksMode};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, Bound, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -395,6 +395,7 @@ impl BaseDocument {
 
         // Make sure we turn on stylo features *before* creating the Stylist
         style_config::set_pref!("layout.grid.enabled", true);
+        style_config::set_pref!("layout.writing-mode.enabled", true);
         style_config::set_pref!("layout.unimplemented", true);
         style_config::set_pref!("layout.columns.enabled", true);
         style_config::set_pref!("layout.css.basic-shape-shape.enabled", true);
@@ -1154,9 +1155,21 @@ impl BaseDocument {
     }
 
     pub fn make_stylesheet(&self, css: impl AsRef<str>, origin: Origin) -> DocumentStyleSheet {
+        self.make_stylesheet_with_url_data(css, origin, self.url.url_extra_data())
+    }
+
+    /// Parse a canonical stylesheet in its own URL context. The document URL
+    /// is not temporarily changed: already parsed declarations and other sheets
+    /// must retain their independent contexts across history/base transitions.
+    pub fn make_stylesheet_with_url(&self, css: impl AsRef<str>, origin: Origin, url: &str) -> Result<DocumentStyleSheet, url::ParseError> {
+        let url = Url::parse(url)?;
+        Ok(self.make_stylesheet_with_url_data(css, origin, style::stylesheets::UrlExtraData(ServoArc::new(url))))
+    }
+
+    fn make_stylesheet_with_url_data(&self, css: impl AsRef<str>, origin: Origin, url: style::stylesheets::UrlExtraData) -> DocumentStyleSheet {
         let data = Stylesheet::from_str(
             css.as_ref(),
-            self.url.url_extra_data(),
+            url,
             origin,
             ServoArc::new(self.guard.wrap(MediaList::empty())),
             self.guard.clone(),
@@ -1206,17 +1219,27 @@ impl BaseDocument {
         let element = &mut self.nodes[node_id].element_data_mut().unwrap();
         element.special_data = SpecialElementData::Stylesheet(stylesheet.clone());
 
-        // TODO: Nodes could potentially get reused so ordering by node_id might be wrong.
-        let insertion_point = self
-            .nodes_to_stylesheet
-            .range((Bound::Excluded(node_id), Bound::Unbounded))
-            .next()
-            .map(|(_, sheet)| sheet);
+        // Canonical nodes can be inserted or moved independently of allocation
+        // order. Author stylesheet cascade order is document tree order.
+        let mut pending = vec![self.root_node_id];
+        let mut seen_owner = false;
+        let mut insertion_point = None;
+        while let Some(current) = pending.pop() {
+            if current == node_id {
+                seen_owner = true;
+            } else if seen_owner {
+                if let Some(sheet) = self.nodes_to_stylesheet.get(&current) {
+                    insertion_point = Some(sheet.clone());
+                    break;
+                }
+            }
+            pending.extend(self.nodes[current].children.iter().rev().copied());
+        }
 
         if let Some(insertion_point) = insertion_point {
             self.stylist.insert_stylesheet_before(
                 stylesheet,
-                insertion_point.clone(),
+                insertion_point,
                 &self.guard.read(),
             )
         } else {
@@ -2217,6 +2240,9 @@ impl BaseDocument {
 
     /// Computes the size and position of the `Node` relative to the viewport
     pub fn get_client_bounding_rect(&self, node_id: NodeId) -> Option<BoundingRect> {
+        if let Some(rect) = self.table_internal_rect(node_id) {
+            return Some(rect);
+        }
         // Non-atomic inline elements have no layout box of their own: return
         // the union of their per-line-box fragment rects.
         if let Some(rects) = self.inline_fragment_rects(node_id) {
@@ -2346,6 +2372,9 @@ impl BaseDocument {
                         add(x0, y0, x1, y1);
                     }
                     PositionedLayoutItem::InlineBox(inline_box) => {
+                        if inline_box.id == crate::layout::list::DISCLOSURE_MARKER_ID {
+                            continue;
+                        }
                         if !is_in_target(NodeId::from_u64(inline_box.id)) {
                             continue;
                         }

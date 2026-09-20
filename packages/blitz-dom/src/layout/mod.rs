@@ -14,6 +14,7 @@ use style::values::computed::CSSPixelLength;
 use style::values::computed::length_percentage::CalcLengthPercentage;
 use stylo_taffy::TaffyStyloStyle;
 use taffy::{
+    MaybeResolve,
     BlockContext, CoreStyle as _, FlexDirection, LayoutContainingBlock, LayoutPartialTree, NodeId,
     ResolveOrZero, RoundTree, RunMode, TraversePartialTree, TraverseTree, compute_block_layout,
     compute_cached_layout, compute_flexbox_layout, compute_grid_layout, compute_leaf_layout,
@@ -30,7 +31,6 @@ pub(crate) mod table;
 use self::replaced::{
     IntrinsicSizes, ReplacedContext, compute_replaced_layout, is_replaced_element,
 };
-use self::table::TableTreeWrapper;
 
 /// The default object size for replaced elements
 /// (https://drafts.csswg.org/css-images/#default-object-size).
@@ -74,6 +74,112 @@ pub(crate) fn resolve_calc_value(calc_ptr: *const (), parent_size: f32) -> f32 {
 }
 
 impl BaseDocument {
+    fn svg_intrinsic_sizes(&self, id: blitz_traits::node_id::NodeId) -> Option<(IntrinsicSizes, Size<f32>)> {
+        let node = &self.nodes[id];
+        let element = node.element_data()?;
+        if element.name.local != local_name!("svg") || element.name.ns != markup5ever::ns!(svg) {
+            return None;
+        }
+        // Root attributes define intrinsic content dimensions independently of
+        // the CSS preferred size: width="40" survives authored width:auto.
+        // The existing Stylo cascade separately supplies the preferred box size.
+        let dimension = |name| {
+            use style::values::specified::NoCalcLength;
+            use style_traits::ParsingMode;
+            let value = element.attr(name)?.trim();
+            let end = value.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len();
+            let (number, unit) = value.split_at(end);
+            let number = number.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0)?;
+            if unit.is_empty() { return Some(number); }
+            let length = NoCalcLength::parse_dimension_with_flags(ParsingMode::DEFAULT, false, number, unit).ok()?;
+            length.to_px_if_absolute().or_else(|| match unit {
+                "em" => node.primary_styles().map(|style| number * style.clone_font_size().used_size().px()),
+                "rem" => self.root_element().primary_styles().map(|style| number * style.clone_font_size().used_size().px()),
+                _ => None,
+            })
+        };
+        let width = dimension(local_name!("width"));
+        let height = dimension(local_name!("height"));
+        let view_box = element.attr(local_name!("viewBox")).and_then(|value| {
+            let values: Vec<f32> = value.split(|c: char| c.is_ascii_whitespace() || c == ',')
+                .filter(|part| !part.is_empty()).map(str::parse).collect::<Result<_, _>>().ok()?;
+            (values.len() == 4 && values.iter().all(|v| v.is_finite()) && values[2] > 0.0 && values[3] > 0.0)
+                .then(|| values[2] / values[3])
+        });
+        let ratio = match (width, height) {
+            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some(w / h),
+            _ => view_box,
+        };
+        Some((IntrinsicSizes { width, height, ratio }, DEFAULT_OBJECT_SIZE))
+    }
+
+    fn menu_list_intrinsic_size(
+        &mut self,
+        id: blitz_traits::node_id::NodeId,
+    ) -> Option<(taffy::Size<f32>, f32)> {
+        let node = &self.nodes[id];
+        let element = node.element_data()?;
+        if element.name.local != local_name!("select")
+            || element.has_attr(local_name!("multiple"))
+            || element
+                .attr(local_name!("size"))
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|n| n > 1)
+        {
+            return None;
+        }
+        let style = node.primary_styles()?;
+        let scale = self.viewport.scale();
+        let font_size = style.clone_font_size().used_size().px();
+        let mut fonts = self.font_ctx.lock().unwrap();
+        let (ascent, descent, leading) = crate::font_metrics::font_line_metrics(
+            &mut fonts,
+            style.get_font(),
+            font_size,
+            scale,
+        )?;
+        let line_height = ascent + descent + leading;
+        let native_theme =
+            style.clone_appearance() != style::values::specified::box_::Appearance::None;
+        let mut pending = node.children.to_vec();
+        let mut maximum = 0.0_f32;
+        while let Some(child_id) = pending.pop() {
+            let child = &self.nodes[child_id];
+            let Some(data) = child.element_data() else {
+                continue;
+            };
+            if data.name.local == local_name!("option") {
+                let text = data
+                    .attr(local_name!("label"))
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| child.text_content());
+                let text = text.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+                let option_style = child
+                    .primary_styles()
+                    .map(|value| value.clone())
+                    .unwrap_or_else(|| style.clone());
+                let parley_style = crate::stylo_to_parley::style(child_id, &option_style);
+                let mut builder =
+                    self.layout_ctx
+                        .tree_builder(&mut fonts, scale, true, &parley_style);
+                builder.push_text(&text);
+                let mut layout = parley::Layout::<crate::node::TextBrush>::new();
+                builder.build_into(&mut layout);
+                layout.break_all_lines(None);
+                maximum = maximum.max(layout.width() / scale);
+            } else if data.name.local == local_name!("optgroup") {
+                pending.extend(child.children.iter().copied());
+            }
+        }
+        // Windows Chrome's menu-list theme reserves start=4, end=1+15
+        // (scrollbar arrow), top/bottom=1. Author border/padding are separate.
+        Some((taffy::Size {
+            width: maximum.ceil() + if native_theme { 20.0 } else { 0.0 },
+            height: line_height + if native_theme { 2.0 } else { 0.0 },
+        }, descent + leading / 2.0 + if native_theme { 1.0 } else { 0.0 }))
+    }
+
     fn node_from_id(&self, node_id: taffy::prelude::NodeId) -> &Node {
         &self.nodes[dom_node_id(node_id)]
     }
@@ -81,12 +187,9 @@ impl BaseDocument {
         &mut self.nodes[dom_node_id(node_id)]
     }
 
-    /// The out-of-flow (absolute/fixed) layout children of a node. Every node claims its own
-    /// out-of-flow children as their containing block (see `TaffyStyloStyle::is_containing_block`),
-    /// so this is exactly the set of boxes hoisted to the node.
+    /// The actual positioned children claimed by this containing block.
     fn out_of_flow_child_ids(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        self.child_ids(node_id)
-            .filter(move |child| self.is_out_of_flow(*child))
+        self.node_from_id(node_id).layout_data().hoisted_children.iter().copied().map(taffy_node_id)
     }
 }
 
@@ -97,12 +200,37 @@ impl BaseDocument {
     fn compute_child_layout_internal(
         &mut self,
         node_id: NodeId,
-        inputs: taffy::tree::LayoutInput,
+        mut inputs: taffy::tree::LayoutInput,
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> taffy::tree::LayoutOutput {
+        if self.node_from_id(node_id).layout_data().skipped_details_content {
+            inputs.known_dimensions.height = Some(0.0);
+        }
+        let previous_width = self.node_from_id(node_id).layout_data().active_layout_width;
+        let style = self.node_from_id(node_id).layout_style();
+        let padding = style.padding().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+        let border = style.border().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+        let inset = padding.left + padding.right + border.left + border.right;
+        let content_width = inputs.known_dimensions.width.map(|width| (width - inset).max(0.0))
+            .or_else(|| style.size().width.maybe_resolve(inputs.parent_size.width, resolve_calc_value)
+                .map(|width| (width - if style.box_sizing() == taffy::BoxSizing::BorderBox { inset } else { 0.0 }).max(0.0)));
+        self.node_from_id_mut(node_id).layout_data_mut().active_layout_width = content_width;
         let mut output = self.dispatch_child_layout(node_id, inputs, block_ctx);
+        self.node_from_id_mut(node_id).layout_data_mut().active_layout_width = previous_width;
         if inputs.run_mode == RunMode::PerformLayout {
             compute_oof_layout(self, node_id, &mut output);
+            if dom_node_id(node_id) == self.root_element().id && !output.oof_candidates.is_empty() {
+                let viewport = self.stylist.device().au_viewport_size();
+                let direction = self.node_from_id(node_id).layout_style().direction();
+                let positioned = taffy::compute_oof_layout_for_area(self, node_id, output.oof_candidates.take(),
+                    taffy::OofPositioningArea { size: taffy::Size { width: viewport.width.to_f32_px(), height: viewport.height.to_f32_px() }, offset: taffy::Point::ZERO },
+                    direction, taffy::ContainingBlockClaims::ALL);
+                self.add_hoisted_children(node_id, &positioned.hoisted);
+                for child in positioned.hoisted.iter().copied().map(dom_node_id) {
+                    self.nodes[child].layout_data_mut().viewport_positioned = true;
+                }
+                output.scrollable_overflow_rect = output.scrollable_overflow_rect.union(positioned.scrollable_overflow_rect);
+            }
         }
         output
     }
@@ -113,22 +241,70 @@ impl BaseDocument {
         inputs: taffy::tree::LayoutInput,
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> taffy::tree::LayoutOutput {
+        let svg_intrinsic = self.svg_intrinsic_sizes(dom_node_id(node_id));
+        if let Some((size, baseline_descent)) = self.menu_list_intrinsic_size(dom_node_id(node_id)) {
+            let style = self.nodes[dom_node_id(node_id)].layout_style();
+            let padding = style.padding().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+            let border = style.border().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+            let mut output = compute_leaf_layout(
+                inputs,
+                &self.nodes[dom_node_id(node_id)].layout_style(),
+                resolve_calc_value,
+                |_, _| size,
+            );
+            output.baselines = taffy::Baselines::from_first(Some(output.size.height - border.bottom - padding.bottom - baseline_descent));
+            return output;
+        }
         let node = &mut self.nodes[dom_node_id(node_id)];
+        if node.element_data().is_some_and(|element| element.name.local == local_name!("progress")) {
+            let em = node.primary_styles().map_or(16.0, |style| style.clone_font_size().used_size().px());
+            return compute_leaf_layout(inputs, &node.layout_style(), resolve_calc_value,
+                |_, _| Size { width: 10.0 * em, height: em });
+        }
 
-        let font_styles = node.primary_styles().map(|style| {
-            use style::values::computed::font::LineHeight;
-
-            let font_size = style.clone_font_size().used_size().px();
-            let line_height = match style.clone_line_height() {
-                LineHeight::Normal => font_size * 1.2,
-                LineHeight::Number(num) => font_size * num.0,
-                LineHeight::Length(value) => value.0.px(),
-            };
-
-            (font_size, line_height)
+        let is_text_control = node.element_data().is_some_and(|element| {
+            element.name.local == local_name!("input")
+                || element.name.local == local_name!("textarea")
         });
-        let font_size = font_styles.map(|s| s.0);
+        let font_styles = node
+            .primary_styles()
+            .filter(|_| is_text_control)
+            .map(|style| {
+                use style::values::computed::font::LineHeight;
+
+                let font_size = style.clone_font_size().used_size().px();
+                let line_height = match style.clone_line_height() {
+                    LineHeight::Normal => crate::font_metrics::normal_line_height(
+                        &mut self.font_ctx.lock().unwrap(),
+                        style.get_font(),
+                        font_size,
+                        self.viewport.scale(),
+                    )
+                    .unwrap_or(font_size * 1.2),
+                    LineHeight::Number(num) => font_size * num.0,
+                    LineHeight::Length(value) => value.0.px(),
+                };
+
+                let widths = crate::font_metrics::control_character_widths(
+                    &mut self.font_ctx.lock().unwrap(),
+                    style.get_font(),
+                    font_size,
+                );
+                (font_size, line_height, widths)
+            });
         let resolved_line_height = font_styles.map(|s| s.1);
+        let control_widths = font_styles.and_then(|s| s.2);
+        let control_scrollbar_reserve = node.primary_styles().filter(|_| is_text_control).map_or(0.0, |style| {
+            use style::values::computed::Overflow;
+            use style::properties::generated::longhands::scrollbar_width::computed_value::T as ScrollbarWidth;
+            if matches!(style.clone_overflow_y(), Overflow::Auto | Overflow::Scroll) {
+                match style.clone_scrollbar_width() {
+                    ScrollbarWidth::None => 0.0,
+                    ScrollbarWidth::Thin => 10.0,
+                    ScrollbarWidth::Auto => 15.0,
+                }
+            } else { 0.0 }
+        });
 
         match &mut node.data {
             NodeData::Text(data) => {
@@ -167,23 +343,30 @@ impl BaseDocument {
             NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
                 // TODO: deduplicate with single-line text input
                 if *element_data.name.local == *"textarea" {
+                    // Chrome's Windows classic-control theme reserves its
+                    // scrollbar width in the intrinsic cols size even before
+                    // content overflows. This is not border or content padding.
                     let rows = element_data
                         .attr(local_name!("rows"))
-                        .and_then(|val| val.parse::<f32>().ok())
+                        .and_then(|val| val.parse::<u32>().ok())
+                        .filter(|&n| n > 0)
+                        .map(|n| n as f32)
                         .unwrap_or(2.0);
 
                     let cols = element_data
                         .attr(local_name!("cols"))
-                        .and_then(|val| val.parse::<f32>().ok());
+                        .and_then(|val| val.parse::<u32>().ok())
+                        .filter(|&n| n > 0)
+                        .map(|n| n as f32)
+                        .unwrap_or(20.0);
 
                     return compute_leaf_layout(
                         inputs,
                         &node.layout_style(),
                         resolve_calc_value,
                         |_known_size, _available_space| taffy::Size {
-                            width: cols
-                                .map(|cols| cols * font_size.unwrap_or(16.0) * 0.6)
-                                .unwrap_or(300.0),
+                            width: (cols * control_widths.map_or(0.0, |widths| widths.0)).ceil()
+                                + control_scrollbar_reserve,
                             height: resolved_line_height.unwrap_or(16.0) * rows,
                         },
                     );
@@ -219,16 +402,20 @@ impl BaseDocument {
                             );
                         }
                         None | Some("text" | "password" | "email" | "tel" | "url" | "search") => {
+                            let columns = element_data
+                                .attr(local_name!("size"))
+                                .and_then(|value| value.parse::<u32>().ok())
+                                .filter(|&value| value > 0)
+                                .unwrap_or(20) as f32;
+                            let (average, maximum) = control_widths.unwrap_or((0.0, 0.0));
+                            let intrinsic_width =
+                                (columns * average + (maximum - average).max(0.0)).ceil();
                             return compute_leaf_layout(
                                 inputs,
                                 &node.layout_style(),
                                 resolve_calc_value,
                                 |_known_size, _available_space| taffy::Size {
-                                    width: match inputs.available_space.width {
-                                        AvailableSpace::Definite(limit) => limit.min(300.0),
-                                        AvailableSpace::MinContent => 0.0,
-                                        AvailableSpace::MaxContent => 300.0,
-                                    },
+                                    width: intrinsic_width,
                                     height: resolved_line_height.unwrap_or(16.0),
                                 },
                             );
@@ -254,8 +441,23 @@ impl BaseDocument {
                     };
 
                     // Get the element's intrinsic dimensions and default object size
-                    let (intrinsic_sizes, default_object_size) = match &element_data.special_data {
+                    let (intrinsic_sizes, default_object_size) = if let Some(intrinsic) = svg_intrinsic { intrinsic } else { match &element_data.special_data {
                         SpecialElementData::Image(image_data) => match &**image_data {
+                            ImageData::Intrinsic { width, height, .. } => {
+                                let (width, height) = (*width as f32, *height as f32);
+                                if width > 0.0 && height > 0.0 {
+                                    (
+                                        IntrinsicSizes {
+                                            width: Some(width),
+                                            height: Some(height),
+                                            ratio: Some(width / height),
+                                        },
+                                        DEFAULT_OBJECT_SIZE,
+                                    )
+                                } else {
+                                    (IntrinsicSizes::default(), taffy::Size::ZERO)
+                                }
+                            }
                             ImageData::Raster(image) => {
                                 let (width, height) = (image.width as f32, image.height as f32);
                                 (
@@ -332,7 +534,7 @@ impl BaseDocument {
                             )
                         }
                         _ => unreachable!(),
-                    };
+                    }};
 
                     let replaced_context = ReplacedContext {
                         intrinsic_sizes,
@@ -358,11 +560,7 @@ impl BaseDocument {
                     };
                     let context = Arc::clone(context);
 
-                    let mut table_wrapper = TableTreeWrapper {
-                        doc: self,
-                        ctx: context,
-                    };
-                    let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
+                    let mut output = self.compute_table_layout(dom_node_id(node_id), context, inputs);
 
                     // HACK: Cap scrollable overflow at node size to prevent scrolling
                     output.scrollable_overflow_rect.left = 0.0;
@@ -452,8 +650,22 @@ impl LayoutPartialTree for BaseDocument {
     fn compute_child_layout(
         &mut self,
         node_id: NodeId,
-        inputs: taffy::LayoutInput,
+        mut inputs: taffy::LayoutInput,
     ) -> taffy::LayoutOutput {
+        // Taffy's flex intrinsic query omits the known containing width. A
+        // ratio-only SVG needs that width for its natural preferred size before
+        // flex shrink. Supply the live producer input, not a previous rectangle,
+        // and include it in available_space BEFORE the layout cache lookup.
+        if inputs.available_space.width == AvailableSpace::MaxContent
+            && inputs.parent_size.width.is_none()
+            && self.svg_intrinsic_sizes(dom_node_id(node_id)).is_some_and(|(size, _)|
+                size.width.is_none() && size.height.is_none() && size.ratio.is_some()) {
+            if let Some(width) = self.node_from_id(node_id).layout_parent.get()
+                .and_then(|parent| self.nodes[parent].layout_data().active_layout_width) {
+                inputs.available_space.width = AvailableSpace::Definite(width);
+                inputs.parent_size.width = Some(width);
+            }
+        }
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             tree.compute_child_layout_internal(node_id, inputs, None)
         })
@@ -470,10 +682,24 @@ impl LayoutContainingBlock for BaseDocument {
         self.node_from_id(node_id).layout_style()
     }
 
-    // Hoisted children are derived from the layout children (see `out_of_flow_child_ids`)
-    // rather than recorded, so there is nothing to store here.
-    fn clear_hoisted_children(&mut self, _node_id: NodeId) {}
-    fn add_hoisted_children(&mut self, _node_id: NodeId, _hoisted: &[NodeId]) {}
+    fn clear_hoisted_children(&mut self, node_id: NodeId) {
+        let owner = dom_node_id(node_id);
+        let previous = std::mem::take(&mut self.nodes[owner].layout_data_mut().hoisted_children);
+        for child in previous {
+            if self.nodes[child].layout_data().geometry_parent == Some(owner) {
+                self.nodes[child].layout_data_mut().geometry_parent = None;
+                self.nodes[child].layout_data_mut().viewport_positioned = false;
+            }
+        }
+    }
+    fn add_hoisted_children(&mut self, node_id: NodeId, hoisted: &[NodeId]) {
+        let owner = dom_node_id(node_id);
+        for child in hoisted.iter().copied().map(dom_node_id) {
+            self.nodes[child].layout_data_mut().geometry_parent = Some(owner);
+            self.nodes[child].layout_data_mut().viewport_positioned = false;
+            self.nodes[owner].layout_data_mut().hoisted_children.push(child);
+        }
+    }
 
     fn get_detailed_layout_info(&self, node_id: NodeId) -> &taffy::DetailedLayoutInfo<Atom> {
         self.node_from_id(node_id)

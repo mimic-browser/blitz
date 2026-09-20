@@ -27,6 +27,7 @@ use super::resolve_calc_value;
 pub struct TableTreeWrapper<'doc> {
     pub(crate) doc: &'doc mut BaseDocument,
     pub(crate) ctx: Arc<TableContext>,
+    expanded_style: Option<taffy::Style<Atom>>,
 }
 
 // Deliberately not `Clone`: `style` may hold raw pointers into `calc_values`.
@@ -36,6 +37,8 @@ pub struct TableContext {
     pub cells: Vec<TableCell>,
     pub rows: Vec<TableRow>,
     pub columns: Vec<TableColumn>,
+    pub captions: Vec<NodeId>,
+    pub caption_block_start: AtomicRefCell<f32>,
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
@@ -340,7 +343,13 @@ pub(crate) fn build_table_context(
         };
     }
 
-    let layout_children = cells.iter().map(|cell| cell.node_id).collect();
+    let captions: Vec<_> = children.iter().copied().filter(|id| {
+        doc.nodes[*id].display_style().is_some_and(|display| {
+            display.outside() == DisplayOutside::TableCaption
+        })
+    }).collect();
+    let layout_children = cells.iter().map(|cell| cell.node_id)
+        .chain(captions.iter().copied()).collect();
     let root_node = &mut doc.nodes[table_root_node_id];
     root_node.children = children;
 
@@ -350,6 +359,8 @@ pub(crate) fn build_table_context(
             cells,
             rows,
             columns,
+            captions,
+            caption_block_start: AtomicRefCell::new(0.0),
             computed_grid_info: AtomicRefCell::new(None),
             border_collapse,
             border_style: first_cell_border,
@@ -524,6 +535,12 @@ fn collect_table_cells(
                 .map(|v| v.clamp(1, 65534))
                 .unwrap_or(1);
             let mut style = stylo_taffy::to_taffy_style(stylo_style);
+            // A table cell's specified height is a row minimum, not a fixed
+            // grid-item height. Once the row is sized, every cell fills it.
+            if style.size.height.tag() == taffy::CompactLength::LENGTH_TAG {
+                style.min_size.height = style_helpers::length(style.size.height.value());
+                style.size.height = style_helpers::auto();
+            }
             let col = cursor.next_free();
 
             if first_cell_border.is_none() {
@@ -619,8 +636,11 @@ fn collect_table_cells(
         | DisplayInside::FlowRoot
         | DisplayInside::Flex
         | DisplayInside::Grid => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            // Probably a table caption: ignore
+            // Captions establish their own formatting context, constructed with
+            // the table's other layout children. Do not discard their damage.
+            if display.outside() != DisplayOutside::TableCaption {
+                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            }
             // println!(
             //     "Warning: ignoring non-table typed descendent of table ({:?})",
             //     display.inside()
@@ -638,6 +658,115 @@ fn collect_table_cells(
 }
 
 pub struct RangeIter(Range<usize>);
+
+impl BaseDocument {
+    /// Produce the table wrapper (captions and grid) in a single layout pass.
+    /// The canonical table remains the owner; captions are real layout children,
+    /// and internal row boxes use the retained grid offset below. Readback never
+    /// fabricates caption rectangles or repeats caption layout.
+    pub(crate) fn compute_table_layout(
+        &mut self,
+        node_id: NodeId,
+        context: Arc<TableContext>,
+        inputs: taffy::LayoutInput,
+    ) -> taffy::LayoutOutput {
+        use taffy::{AvailableSpace, CoreStyle, Layout, LayoutInput, Point, RunMode, Size, SizingMode};
+        use style::values::computed::table::CaptionSide;
+
+        let mut wrapper = TableTreeWrapper { doc: self, ctx: Arc::clone(&context), expanded_style: None };
+        let mut grid_inputs = inputs;
+        // CAPMIN participates in the wrapper's minimum width, even when the
+        // cell grid is narrower. It is not the caption's max-content width.
+        let mut caption_min_width: f32 = 0.0;
+        for &caption in &context.captions {
+            let size = wrapper.doc.compute_child_layout(crate::taffy_node_id(caption), LayoutInput {
+                known_dimensions: Size::NONE,
+                available_space: Size { width: AvailableSpace::MinContent, height: AvailableSpace::MaxContent },
+                run_mode: RunMode::ComputeSize,
+                sizing_mode: SizingMode::InherentSize,
+                vertical_margins_are_collapsible: taffy::Line::FALSE,
+                ..inputs
+            }).size;
+            let margin = wrapper.doc.nodes[caption].layout_style().margin()
+                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+            caption_min_width = caption_min_width.max(size.width + margin.left + margin.right);
+        }
+        let mut output = taffy::compute_grid_layout(&mut wrapper, crate::taffy_node_id(node_id), grid_inputs);
+        if output.size.width < caption_min_width {
+            grid_inputs.known_dimensions.width = Some(caption_min_width);
+            // Cell widths are table-column constraints, not CSS-grid fixed
+            // tracks: CAPMIN's extra wrapper width must reach the cells too.
+            // Preserve each specified minimum while distributing surplus in
+            // proportion to its width, rather than leaving empty grid space.
+            let mut expanded = context.style.clone();
+            for track in &mut expanded.grid_template_columns {
+                if let taffy::GridTemplateComponent::Single(track) = track {
+                    if track.max.into_raw().tag() == taffy::CompactLength::LENGTH_TAG {
+                        *track = style_helpers::minmax(track.min, style_helpers::fr(track.max.into_raw().value().max(1.0)));
+                    }
+                }
+            }
+            wrapper.expanded_style = Some(expanded);
+            output = taffy::compute_grid_layout(&mut wrapper, crate::taffy_node_id(node_id), grid_inputs);
+        }
+        if context.captions.is_empty() {
+            return output;
+        }
+        let grid_height = output.size.height;
+        let mut top: f32 = 0.0;
+        let mut bottom: f32 = 0.0;
+        let mut boxes = Vec::with_capacity(context.captions.len());
+        for &caption in &context.captions {
+            let style = wrapper.doc.nodes[caption].layout_style();
+            let parent_size = Size { width: Some(output.size.width), height: None };
+            let margin = style.margin().resolve_or_zero(parent_size, resolve_calc_value);
+            let padding = style.padding().resolve_or_zero(parent_size.width, resolve_calc_value);
+            let border = style.border().resolve_or_zero(parent_size.width, resolve_calc_value);
+            let is_bottom = wrapper.doc.nodes[caption].primary_styles().unwrap()
+                .clone_caption_side() == CaptionSide::Bottom;
+            let mut child = wrapper.doc.compute_child_layout(crate::taffy_node_id(caption), LayoutInput {
+                known_dimensions: Size { width: Some((output.size.width - margin.left - margin.right).max(0.0)), height: None },
+                parent_size,
+                available_space: Size { width: AvailableSpace::Definite(output.size.width), height: AvailableSpace::MaxContent },
+                sizing_mode: SizingMode::InherentSize,
+                vertical_margins_are_collapsible: taffy::Line::FALSE,
+                ..inputs
+            });
+            let cursor = if is_bottom { &mut bottom } else { &mut top };
+            let location = Point { x: margin.left, y: *cursor + margin.top };
+            *cursor += margin.top + child.size.height + margin.bottom;
+            child.oof_candidates.translate(location);
+            let layout = Layout {
+                location, size: child.size, margin, padding, border,
+                scrollable_overflow_rect: child.scrollable_overflow_rect,
+                ..Layout::new()
+            };
+            boxes.push((caption, is_bottom, layout, child.oof_candidates));
+        }
+        let grid_offset = Point { x: 0.0, y: top };
+        output.oof_candidates.translate(grid_offset);
+        output.baselines.first = output.baselines.first.map(|value| value + top);
+        output.baselines.last = output.baselines.last.map(|value| value + top);
+        output.size.height += top + bottom;
+        output.scrollable_overflow_rect.bottom += top + bottom;
+        if inputs.run_mode == RunMode::PerformLayout {
+            *context.caption_block_start.borrow_mut() = top;
+            for cell in &context.cells {
+                wrapper.doc.nodes[cell.node_id].unrounded_layout_mut().location.y += top;
+            }
+            for (caption, is_bottom, mut layout, mut candidates) in boxes {
+                if is_bottom {
+                    let shift = Point { x: 0.0, y: top + grid_height };
+                    layout.location.y += shift.y;
+                    candidates.translate(shift);
+                }
+                wrapper.doc.set_unrounded_layout(crate::taffy_node_id(caption), &layout);
+                output.oof_candidates.append(&mut candidates);
+            }
+        }
+        output
+    }
+}
 
 impl Iterator for RangeIter {
     type Item = taffy::NodeId;
@@ -679,7 +808,7 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_> {
     type CustomIdent = Atom;
 
     fn get_core_container_style(&self, _node_id: taffy::NodeId) -> &taffy::Style<Atom> {
-        &self.ctx.style
+        self.expanded_style.as_ref().unwrap_or(&self.ctx.style)
     }
 
     fn resolve_calc_value(&self, calc_ptr: *const (), parent_size: f32) -> f32 {

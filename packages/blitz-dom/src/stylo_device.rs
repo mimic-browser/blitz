@@ -69,6 +69,18 @@ pub(crate) fn make_device(
     let device_size = euclid::Size2D::new(width, height) * viewport.scale();
     let device_pixel_ratio = euclid::Scale::new(viewport.scale());
 
+    // Chrome 152's profile default is a named face, not the authored generic
+    // `serif` keyword. Put it in device initial values so all:initial and
+    // inheritance agree, without rewriting explicit author family tokens.
+    use style::values::computed::font::{FamilyName, FontFamilyList, FontFamilyNameSyntax, SingleFontFamily};
+    let mut initial_font = Font::initial_values();
+    initial_font.font_family.families = FontFamilyList {
+        list: style::ArcSlice::from_iter(std::iter::once(SingleFontFamily::FamilyName(FamilyName {
+            name: style::Atom::from("Times New Roman"),
+            syntax: FontFamilyNameSyntax::Quoted,
+        }))),
+    };
+
     Device::new(
         media_type,
         QuirksMode::NoQuirks,
@@ -76,7 +88,7 @@ pub(crate) fn make_device(
         device_size,
         device_pixel_ratio,
         Box::new(BlitzFontMetricsProvider { font_ctx }),
-        ComputedValues::initial_values_with_font_override(Font::initial_values()),
+        ComputedValues::initial_values_with_font_override(initial_font),
         match viewport.color_scheme {
             ColorScheme::Light => PrefersColorScheme::Light,
             ColorScheme::Dark => PrefersColorScheme::Dark,

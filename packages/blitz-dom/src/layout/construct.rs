@@ -602,6 +602,26 @@ fn collect_layout_children_with_wrap(
         },
     );
 
+    // Closed details retains a laid-out, skipped content subtree for synchronous
+    // geometry readback. Only the first summary contributes to the host's flow.
+    // This is a derived anonymous wrapper, not a canonical DOM mutation.
+    let closed_details = doc.nodes[container_node_id].element_data().is_some_and(|element| {
+        element.name.local == local_name!("details") && !element.has_attr(local_name!("open"))
+    });
+    if closed_details && container_display.inside() != DisplayInside::None {
+        let children = doc.nodes[container_node_id].children.clone();
+        let summary = children.iter().copied().find(|id| {
+            doc.nodes[*id].element_data().is_some_and(|element| element.name.local == local_name!("summary"))
+        });
+        if let Some(summary) = summary { out.push(summary, doc); }
+        out.create_anonymous_block(container_node_id, doc);
+        let content_id = out.anonymous_block_id.unwrap();
+        doc.nodes[content_id].layout_data_mut().skipped_details_content = true;
+        doc.nodes[content_id].children.extend(children.iter().copied().filter(|id| Some(*id) != summary));
+        out.maybe_push_anon_block(doc);
+        return;
+    }
+
     match container_display.inside() {
         DisplayInside::None => {}
         DisplayInside::Contents => {
@@ -959,6 +979,14 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     let styles = editor.edit_styles();
     styles.retain(|_| false);
     styles.insert(StyleProperty::FontSize(parley_style.font_size));
+    styles.insert(StyleProperty::FontFamily(parley_style.font_family));
+    styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
+    styles.insert(StyleProperty::FontStyle(parley_style.font_style));
+    styles.insert(StyleProperty::FontWidth(parley_style.font_width));
+    styles.insert(StyleProperty::FontFeatures(parley_style.font_features));
+    styles.insert(StyleProperty::FontVariations(parley_style.font_variations));
+    styles.insert(StyleProperty::LetterSpacing(parley_style.letter_spacing));
+    styles.insert(StyleProperty::WordSpacing(parley_style.word_spacing));
     styles.insert(StyleProperty::LineHeight(parley_style.line_height));
     styles.insert(StyleProperty::Brush(parley_style.brush));
 
@@ -1153,6 +1181,23 @@ pub(crate) fn build_inline_layout_into(
         .and_then(|el| el.list_item_data.as_deref())
     {
         match marker {
+            Marker::Char('▾' | '▸') => {
+                // Chrome's disclosure marker is a geometric symbol, not a font
+                // glyph: 0.66em symbol plus 0.4em end margin, each LayoutUnit
+                // truncated. Produce the inline contribution before line layout.
+                // Chromium list/list_marker.cc: DisclosureSymbolSize and
+                // InlineMarginsForInside (Chrome 152).
+                let em = root_node_style.as_ref().unwrap().clone_font_size().used_size().px();
+                let symbol = (em * 0.66 * 64.0).trunc() / 64.0;
+                let margin = (em * 0.4 * 64.0).trunc() / 64.0;
+                builder.push_inline_box(InlineBox {
+                    id: super::list::DISCLOSURE_MARKER_ID,
+                    kind: InlineBoxKind::InFlow,
+                    index: 0,
+                    width: (symbol + margin) * scale,
+                    height: symbol * scale,
+                });
+            }
             // Bullet glyphs live in the bundled bullet font. The position-outside
             // path already asks for it; without the same span here a marker like
             // disclosure-closed (U+25B8) falls back to the element's own font and
@@ -1203,6 +1248,12 @@ pub(crate) fn build_inline_layout_into(
     }
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    if let Some(style) = root_node_style.as_deref() {
+        if let Some((ascent, descent, _)) = crate::font_metrics::font_line_metrics(
+            font_ctx, style.get_font(), style.clone_font_size().used_size().px(), scale) {
+            text_layout.layout.set_line_strut(ascent * scale, descent * scale, root_line_height * scale);
+        }
+    }
     return;
 
     fn build_inline_layout_recursive(
