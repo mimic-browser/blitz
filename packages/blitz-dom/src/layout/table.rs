@@ -717,11 +717,13 @@ impl BaseDocument {
         let mut bottom: f32 = 0.0;
         let mut boxes = Vec::with_capacity(context.captions.len());
         for &caption in &context.captions {
-            let style = wrapper.doc.nodes[caption].layout_style();
             let parent_size = Size { width: Some(output.size.width), height: None };
-            let margin = style.margin().resolve_or_zero(parent_size, resolve_calc_value);
-            let padding = style.padding().resolve_or_zero(parent_size.width, resolve_calc_value);
-            let border = style.border().resolve_or_zero(parent_size.width, resolve_calc_value);
+            let (margin, padding, border) = {
+                let style = wrapper.doc.nodes[caption].layout_style();
+                (style.margin().resolve_or_zero(parent_size, resolve_calc_value),
+                 style.padding().resolve_or_zero(parent_size.width, resolve_calc_value),
+                 style.border().resolve_or_zero(parent_size.width, resolve_calc_value))
+            };
             let is_bottom = wrapper.doc.nodes[caption].primary_styles().unwrap()
                 .clone_caption_side() == CaptionSide::Bottom;
             let mut child = wrapper.doc.compute_child_layout(crate::taffy_node_id(caption), LayoutInput {

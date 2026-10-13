@@ -80,6 +80,45 @@ pub enum DocGuard<'a> {
     Mutex(MutexGuard<'a, BaseDocument>),
 }
 
+#[cfg(test)]
+mod layout_viewport_gutter_tests {
+    use super::*;
+    use crate::{Attribute, qual_name};
+    use blitz_traits::shell::ColorScheme;
+
+    #[test]
+    fn root_available_width_does_not_change_css_viewport_units() {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(qual_name!("body"), vec![Attribute {
+            name: qual_name!("style"),
+            value: "margin:0".into(),
+        }]);
+        let unit = mutator.create_element(qual_name!("div"), vec![Attribute {
+            name: qual_name!("style"),
+            value: "position:fixed;width:100vw;height:1px".into(),
+        }]);
+        mutator.append_children(body, &[unit]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+
+        doc.resolve(0.0);
+        assert_eq!(doc.get_client_bounding_rect(html).unwrap().width, 400.0);
+        assert_eq!(doc.get_client_bounding_rect(unit).unwrap().width, 400.0);
+
+        doc.set_layout_viewport_width(Some(385.0));
+        doc.resolve(0.0);
+        assert_eq!(doc.get_client_bounding_rect(html).unwrap().width, 385.0);
+        assert_eq!(doc.get_client_bounding_rect(unit).unwrap().width, 400.0);
+    }
+}
+
 impl Deref for DocGuard<'_> {
     type Target = BaseDocument;
     #[inline(always)]
@@ -201,6 +240,10 @@ pub struct BaseDocument {
     pub(crate) devtool_settings: DevtoolSettings,
     // Viewport details such as the dimensions, HiDPI scale, and zoom factor,
     pub(crate) viewport: Viewport,
+    /// Width available to the root formatting context after a classic
+    /// viewport scrollbar. CSS viewport units and media queries continue to
+    /// use `viewport`, which can differ for `overflow-y: auto`.
+    pub(crate) layout_viewport_width: Option<f32>,
     // Scroll within our viewport
     pub(crate) viewport_scroll: crate::Point<f64>,
     /// CSS media type used to evaluate `@media` rules.
@@ -447,6 +490,7 @@ impl BaseDocument {
             snapshots,
             nodes_to_id,
             viewport,
+            layout_viewport_width: None,
             media_type,
             pending_device_changes: DeviceChanges::empty(),
             style_threading: config.style_threading,
@@ -1964,6 +2008,22 @@ impl BaseDocument {
         let changes = DeviceChanges::from_viewports(&self.viewport, &viewport);
         self.viewport = viewport;
         self.queue_device_changes(changes);
+    }
+
+    /// Reserve a viewport gutter for root layout without changing the CSS
+    /// viewport seen by viewport units or media queries.
+    pub fn set_layout_viewport_width(&mut self, width: Option<f32>) {
+        if self.layout_viewport_width == width {
+            return;
+        }
+        self.layout_viewport_width = width;
+        if let Some(root) = self.try_root_element().map(|node| node.id) {
+            self.get_node_mut(root).unwrap().mark_ancestors_dirty();
+        }
+    }
+
+    pub fn layout_viewport_width(&self) -> Option<f32> {
+        self.layout_viewport_width
     }
 
     /// Returns the current CSS media type used to evaluate `@media` rules.

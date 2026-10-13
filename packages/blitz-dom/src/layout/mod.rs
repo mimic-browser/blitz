@@ -207,13 +207,15 @@ impl BaseDocument {
             inputs.known_dimensions.height = Some(0.0);
         }
         let previous_width = self.node_from_id(node_id).layout_data().active_layout_width;
-        let style = self.node_from_id(node_id).layout_style();
-        let padding = style.padding().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
-        let border = style.border().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
-        let inset = padding.left + padding.right + border.left + border.right;
-        let content_width = inputs.known_dimensions.width.map(|width| (width - inset).max(0.0))
-            .or_else(|| style.size().width.maybe_resolve(inputs.parent_size.width, resolve_calc_value)
-                .map(|width| (width - if style.box_sizing() == taffy::BoxSizing::BorderBox { inset } else { 0.0 }).max(0.0)));
+        let content_width = {
+            let style = self.node_from_id(node_id).layout_style();
+            let padding = style.padding().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+            let border = style.border().resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+            let inset = padding.left + padding.right + border.left + border.right;
+            inputs.known_dimensions.width.map(|width| (width - inset).max(0.0))
+                .or_else(|| style.size().width.maybe_resolve(inputs.parent_size.width, resolve_calc_value)
+                    .map(|width| (width - if style.box_sizing() == taffy::BoxSizing::BorderBox { inset } else { 0.0 }).max(0.0)))
+        };
         self.node_from_id_mut(node_id).layout_data_mut().active_layout_width = content_width;
         let mut output = self.dispatch_child_layout(node_id, inputs, block_ctx);
         self.node_from_id_mut(node_id).layout_data_mut().active_layout_width = previous_width;

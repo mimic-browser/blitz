@@ -437,7 +437,9 @@ impl BaseDocument {
         let size = self.stylist.device().au_viewport_size();
 
         let available_space = taffy::Size {
-            width: AvailableSpace::Definite(size.width.to_f32_px()),
+            width: AvailableSpace::Definite(
+                self.layout_viewport_width.unwrap_or_else(|| size.width.to_f32_px()),
+            ),
             height: AvailableSpace::Definite(size.height.to_f32_px()),
         };
 
